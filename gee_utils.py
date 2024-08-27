@@ -38,6 +38,7 @@ def landmask(img):
 
 
 def inspect_tif(tif_object) -> None:
+    """Display key metrics from tif object"""
     print("DIMENSIONS | height: ", tif_object.height, "width: ", tif_object.width)
     print("BOUNDS | ", tif_object.bounds)
     print("BANDS | count: ", tif_object.count)
@@ -49,13 +50,13 @@ def inspect_tif(tif_object) -> None:
 def process_tif(tif_object) -> dict:
     """
     Processes a tif object and returns a dictionary of bands. Replaces -9999 with np.nan.
-    
+
     Parameters:
     tif_object (rasterio.io.DatasetReader): The tif object to process.
     Returns:
     dict: A dictionary of bands (label and array).
     """
-    # I think b1 = coral, b2 = sand, b3 = algae
+    # I think b1 = algae, b2 = sand, b3 = coral
     bands = {}
     for band in tif_object.indexes:
         b = tif_object.read(band)
@@ -63,3 +64,95 @@ def process_tif(tif_object) -> dict:
         bands[f"b{band}"] = b
     
     return bands
+
+
+def get_value_distribution(band, aoi):
+    """
+    Calculates the value distribution of a given band within a specified area of interest (AOI).
+    
+    Parameters:
+    band (ee.Image): The band for which the value distribution is calculated.
+    aoi (ee.Geometry): The area of interest (AOI) within which the value distribution is calculated.
+    Returns:
+    hist_values (numpy.ndarray): An array containing the histogram values.
+    hist_counts (numpy.ndarray): An array containing the bucket means.
+    Note:
+    The scale parameter should be adjusted according to the specific dataset.
+    The maxPixels parameter specifies the maximum number of pixels to include in the computation.
+    """
+    
+    hist_dict = band.reduceRegion(
+        reducer=ee.Reducer.histogram(),
+        geometry=aoi,
+        scale=8,  # Adjust the scale to your specific dataset
+        maxPixels=1e9
+    ).getInfo()
+
+    hist_values = np.array(hist_dict[band.bandNames().getInfo()[0]]['bucketMeans'])
+    hist_counts = np.array(hist_dict[band.bandNames().getInfo()[0]]['histogram'])
+    return hist_values, hist_counts
+
+
+def alpha_band(image, band_name: str):
+    alpha = image.select(band_name)
+    return image.select(band_name).updateMask(alpha)
+
+
+
+def legend_gradient(map, title, visual, position='bottom-right'):
+    # Create the map object
+
+    # Create the legend panel
+    legend = geemap.map().add_legend(title=title, title_font_size='15px', 
+                                     position=position, width='100px')
+
+    # Create the gradient image
+    lon = ee.Image.pixelLonLat().select('latitude')
+    gradient = lon.multiply((visual['max'] - visual['min']) / 100.0).add(visual['min'])
+    legend_image = gradient.visualize(**visual)
+    
+    # Generate a thumbnail from the image
+    thumbnail = geemap.ee_to_thumbnail(legend_image, dimensions='10x50', bbox='0,0,10,100')
+
+    # Add the title, gradient image, and labels to the legend panel
+    legend.add_child(geemap.Label(title, fontSize='15px', fontWeight='bold', textAlign='center'))
+    legend.add_child(thumbnail)
+    legend.add_child(geemap.Label(str(visual['max']), textAlign='center'))
+    legend.add_child(geemap.Label(str(visual['min']), textAlign='center'))
+
+    # Add the legend to the map
+    Map.add(legend)
+    return Map
+
+
+def resample_histogram(central_values, bin_counts, nbins: int = 100):
+    """Used when central_values are not evenly spaced e.g. non-regularly spaced central values"""
+    # Calculate bin edges from central values
+    bin_widths = np.diff(central_values)  # Width of each bin
+    bin_edges = np.concatenate((
+        [central_values[0] - bin_widths[0] / 2],  # Starting edge
+        central_values[:-1] + bin_widths / 2,  # Right edges
+        [central_values[-1] + bin_widths[-1] / 2]  # Ending edge
+    ))
+
+    # Define the new, evenly spaced bin edges
+    new_bin_edges = np.linspace(0, 1, nbins+1)  # 10 new bins between 0 and 1
+
+    # Calculate the new bin counts
+    new_bin_counts = np.zeros(len(new_bin_edges) - 1)
+
+    # Vectorized calculation of bin overlaps and resampling
+    original_bin_ranges = np.vstack([bin_edges[:-1], bin_edges[1:]]).T
+    new_bin_ranges = np.vstack([new_bin_edges[:-1], new_bin_edges[1:]]).T
+
+    # Calculate overlap between original bins and new bins
+    overlap_matrix = np.maximum(0, np.minimum(original_bin_ranges[:, None, 1], new_bin_ranges[None, :, 1]) -
+                                np.maximum(original_bin_ranges[:, None, 0], new_bin_ranges[None, :, 0]))
+
+    # Calculate the fraction of each original bin's count to assign to each new bin
+    proportion_matrix = overlap_matrix / (original_bin_ranges[:, 1] - original_bin_ranges[:, 0])[:, None]
+
+    # Multiply the proportions by the original counts and sum over the original bins
+    new_bin_counts = np.sum(proportion_matrix * bin_counts[:, None], axis=0)
+
+    return new_bin_edges, new_bin_counts
