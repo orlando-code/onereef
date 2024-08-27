@@ -66,7 +66,7 @@ def process_tif(tif_object) -> dict:
     return bands
 
 
-def get_value_distribution(band, aoi):
+def get_value_distribution_from_image(band, aoi, scale: int=8, maxPixels: int=1e9):
     """
     Calculates the value distribution of a given band within a specified area of interest (AOI).
     
@@ -84,8 +84,8 @@ def get_value_distribution(band, aoi):
     hist_dict = band.reduceRegion(
         reducer=ee.Reducer.histogram(),
         geometry=aoi,
-        scale=8,  # Adjust the scale to your specific dataset
-        maxPixels=1e9
+        scale=scale,  # Adjust the scale to your specific dataset
+        maxPixels=maxPixels
     ).getInfo()
 
     hist_values = np.array(hist_dict[band.bandNames().getInfo()[0]]['bucketMeans'])
@@ -125,7 +125,7 @@ def legend_gradient(map, title, visual, position='bottom-right'):
     return Map
 
 
-def resample_histogram(central_values, bin_counts, nbins: int = 100):
+def resample_histogram(central_values, bin_counts, bin_range: tuple[float]=(0,10), nbins: int = 100):
     """Used when central_values are not evenly spaced e.g. non-regularly spaced central values"""
     # Calculate bin edges from central values
     bin_widths = np.diff(central_values)  # Width of each bin
@@ -136,7 +136,7 @@ def resample_histogram(central_values, bin_counts, nbins: int = 100):
     ))
 
     # Define the new, evenly spaced bin edges
-    new_bin_edges = np.linspace(0, 1, nbins+1)  # 10 new bins between 0 and 1
+    new_bin_edges = np.linspace(min(bin_range), max(bin_range), nbins+1)  # 10 new bins between 0 and 1
 
     # Calculate the new bin counts
     new_bin_counts = np.zeros(len(new_bin_edges) - 1)
@@ -156,3 +156,84 @@ def resample_histogram(central_values, bin_counts, nbins: int = 100):
     new_bin_counts = np.sum(proportion_matrix * bin_counts[:, None], axis=0)
 
     return new_bin_edges, new_bin_counts
+
+
+# This helper function returns a list of new band names.
+def get_new_band_names(
+    prefix, 
+    band_names=ee.List(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12'])):
+  seq = ee.List.sequence(1, band_names.length())
+
+  def add_prefix_and_number(b):
+    return ee.String(prefix).cat(ee.Number(b).int())
+
+  return seq.map(add_prefix_and_number)
+
+
+def get_principal_components(centered, scale, region):
+  # Collapse bands into 1D array
+  arrays = centered.toArray()
+
+  # Compute the covariance of the bands within the region.
+  covar = arrays.reduceRegion(
+      reducer=ee.Reducer.centeredCovariance(),
+      geometry=region,
+      scale=scale,
+      maxPixels=1e9,
+  )
+
+  # Get the 'array' covariance result and cast to an array.
+  # This represents the band-to-band covariance within the region.
+  covar_array = ee.Array(covar.get('array'))
+
+  # Perform an eigen analysis and slice apart the values and vectors.
+  eigens = covar_array.eigen()
+
+  # This is a P-length vector of Eigenvalues.
+  eigen_values = eigens.slice(1, 0, 1)
+  # This is a PxP matrix with eigenvectors in rows.
+  eigen_vectors = eigens.slice(1, 1)
+
+  # Convert the array image to 2D arrays for matrix computations.
+  array_image = arrays.toArray(1)
+
+  # Left multiply the image array by the matrix of eigenvectors.
+  principal_components = ee.Image(eigen_vectors).matrixMultiply(array_image)
+
+  # Turn the square roots of the Eigenvalues into a P-band image.
+  sd_image = (
+      ee.Image(eigen_values.sqrt())
+      .arrayProject([0])
+      .arrayFlatten([get_new_band_names('sd')])
+  )
+
+  # Turn the PCs into a P-band image, normalized by SD.
+  return (
+      # Throw out an an unneeded dimension, [[]] -> [].
+      principal_components.arrayProject([0])
+      # Make the one band array image a multi-band image, [] -> image.
+      .arrayFlatten([get_new_band_names('pc')])
+      # Normalize the PCs by their SDs.
+      .divide(sd_image)
+  )
+
+
+def compute_pca(image, roi):
+# Perform PCA
+    pca = image.reduceRegion(
+        reducer=ee.Reducer.principalComponents(3),
+        geometry=roi,
+        scale=30,
+        maxPixels=1e6
+    )
+    return pca
+
+
+def get_polygon_centre_from_coordinates(coords: list[tuple]) -> tuple:
+    """Returns the centre of a polygon from a list of coordinates"""
+    unique_coords = coords[:-1]
+    x = [c[0] for c in unique_coords]
+    y = [c[1] for c in unique_coords]
+    return (sum(x) / len(unique_coords), sum(y) / len(unique_coords))
+
+
