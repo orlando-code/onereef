@@ -12,3 +12,21 @@ def add_ee_layer(self, ee_image_object, vis_params, name):
         overlay=True,
         control=True,
     ).add_to(self)
+
+
+# Creating land mask with NDWI and Random Forest
+def landmask(img):
+    """
+    Applies a land mask to the input image based on the normalized difference water index (NDWI).
+    Parameters:
+    img (ee.Image): The input image to apply the land mask to.
+    Returns:
+    ee.Image: The input image with the land mask applied.
+    """
+    
+    ndwi = img.normalizedDifference(['B3', 'B8'])
+    training = ndwi.sampleRegions(collection=landGeoms.merge(waterGeoms), properties=['class'], scale=3)
+    trained = ee.Classifier.smileRandomForest(10).train(features=training, classProperty='class')
+    classified = ndwi.classify(trained)
+    mask = classified.eq(1)
+    return img.updateMask(mask)
