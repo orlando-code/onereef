@@ -2,6 +2,7 @@ import ee
 
 # general
 import numpy as np
+from itertools import product
 
 # plotting
 import folium
@@ -94,9 +95,11 @@ def get_value_distribution_from_image(band, aoi, scale: int=8, maxPixels: int=1e
 
 
 def alpha_band(image, band_name: str):
+    """
+    Apply opacity mask to layer (zero values = transparent)
+    """
     alpha = image.select(band_name)
     return image.select(band_name).updateMask(alpha)
-
 
 
 def legend_gradient(map, title, visual, position='bottom-right'):
@@ -125,7 +128,7 @@ def legend_gradient(map, title, visual, position='bottom-right'):
     return Map
 
 
-def resample_histogram(central_values, bin_counts, bin_range: tuple[float]=(0,10), nbins: int = 100):
+def resample_histogram(central_values, bin_counts, bin_range: tuple[float]=(0,1), nbins: int = 100):
     """Used when central_values are not evenly spaced e.g. non-regularly spaced central values"""
     # Calculate bin edges from central values
     bin_widths = np.diff(central_values)  # Width of each bin
@@ -237,3 +240,88 @@ def get_polygon_centre_from_coordinates(coords: list[tuple]) -> tuple:
     return (sum(x) / len(unique_coords), sum(y) / len(unique_coords))
 
 
+def tune_n_trees(n_trees, train_set, val_set, image):
+    # To start with, twice the number of covariates you have
+    classifier = ee.Classifier.smileRandomForest(n_trees)\
+        .train(train_set, "class", image.bandNames())
+        # need to specify which bands (not interested in random)
+    
+    accuracy = val_set.classify(classifier)\
+        .errorMatrix("class", "classification").accuracy()
+    
+    return accuracy
+
+
+def classify_by_max_band(image, band_names):
+    """
+    Classifies each pixel in the image based on the band with the highest value.
+
+    Args:
+    image (ee.Image): The input image with multiple bands.
+    band_names (list): A list of band names to compare.
+
+    Returns:
+    ee.Image: An image where each pixel is classified by the band with the highest value.
+    """
+
+    # Create an expression to find the index of the band with the maximum value
+    max_band_index = image.expression(
+        " + ".join([f"(band_{i} >= " + f" && band_{i} >= ".join([f"band_{j}" for j in range(len(band_names)) if j != i]) + f") * {i+1}"
+                    for i in range(len(band_names))]),
+        {f'band_{i}': image.select(band_names[i]) for i in range(len(band_names))}
+    )
+    # Stack the bands into a single image collection
+    band_stack = image.select(band_names).toArray()
+    
+    # Find the index of the maximum value for each pixel
+    max_band_index = band_stack.arrayArgmax().arrayGet([0]).add(1)
+    
+    # Rename to 'Class' for clarity
+    classified_image = max_band_index.rename('class')
+    
+    return classified_image
+
+
+def tune_with_params(params, train_set, val_set, image):
+    """Trains a classifier with given parameters and evaluates accuracy."""
+    
+    # Build the classifier with the current set of parameters
+    classifier = ee.Classifier.smileRandomForest(
+        numberOfTrees=params.get("numberOfTrees", 200),
+        variablesPerSplit=params.get("variablesPerSplit", None),
+        minLeafPopulation=params.get("minLeafPopulation", 1),
+        bagFraction=params.get("bagFraction", 0.5),
+        maxNodes=params.get("maxNodes", None),
+        seed=params.get("seed", 42)
+    ).train(train_set, "class", image.bandNames())
+    
+    confusion_matrix = val_set.classify(classifier).errorMatrix("class", "classification")
+    # Classify the validation set and calculate accuracy
+    accuracy = confusion_matrix.accuracy()
+    f1_score = confusion_matrix.fscore(beta=1)
+    # TODO: calculate balanced accuracy
+    # balanced_accuracy = calc_balanced_accuracy_ee(confusion_matrix.array())
+    
+    return ee.Dictionary({
+        "params": params,
+        "accuracy": accuracy,
+        "f1_score": f1_score,
+        # "balanced_accuracy": balanced_accuracy
+    })
+
+
+def grid_search(params_grid, train_set, val_set, image):
+    """
+    Performs a grid search over the specified parameters
+    """
+    # Generate all combinations of parameters
+    keys, values = zip(*params_grid.items())
+    param_combinations = [dict(zip(keys, combination)) for combination in product(*values)]
+    
+    # Convert the parameter combinations to an Earth Engine list of dictionaries
+    param_combinations_ee = ee.List(param_combinations)
+    
+    # Map the tune_with_params function over the parameter combinations
+    results = param_combinations_ee.map(lambda params: tune_with_params(ee.Dictionary(params), train_set, val_set, image))
+    
+    return results
