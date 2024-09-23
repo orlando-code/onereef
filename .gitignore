@@ -25,3 +25,5 @@ __pycache__/
 
 # ignore logging: specific to user
 /logs
+
+/*.egg-info
